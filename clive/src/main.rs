@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -25,7 +26,7 @@ const DEFAULT_MODEL: &str = "llama3.1";
     disable_help_subcommand = true,
     infer_subcommands = true,
     next_line_help = true,
-    after_help = "Examples:\n  clive ollama serve --detach\n  clive ollama pull qwen2.5-coder:latest\n  clive session --model qwen2.5-coder:latest\n  clive edit src/main.rs \"Refactor error handling\" --write --backup"
+    after_help = "Examples:\n  clive chat \"Explain Rust ownership\" --model qwen2.5-coder:latest\n  clive session --model qwen2.5-coder:latest\n  clive agent \"Refactor error handling\" --files src/main.rs --apply --verify \"cargo check -q\"\n  clive ollama pull qwen2.5-coder:latest\n  clive edit src/main.rs \"Add structured logging\" --write --backup"
 )]
 struct Cli {
     /// Override Ollama base URL (default: http://127.0.0.1:11434)
@@ -47,48 +48,65 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Send a prompt to an Ollama model
+    /// Example: clive chat "Explain Rust ownership" --model qwen2.5-coder:latest
     #[command(visible_alias = "ask")]
     Chat(ChatArgs),
 
     /// List local Ollama models
+    /// Example: clive models
     #[command(visible_alias = "ls")]
     Models,
 
     /// Check Ollama connectivity
+    /// Example: clive doctor
     #[command(visible_alias = "health")]
     Doctor,
 
     /// Start an interactive multi-turn coding session
+    /// Example: clive session --model qwen2.5-coder:latest
     #[command(visible_alias = "repl")]
     Session(SessionArgs),
 
+    /// Run an autonomous coding workflow across multiple files
+    /// Example: clive agent "Refactor error handling" --files src/main.rs --apply --verify "cargo check -q"
+    #[command(visible_alias = "run")]
+    Agent(AgentArgs),
+
     /// Manage Ollama from Clive (serve, pull, rm)
+    /// Example: clive ollama pull qwen2.5-coder:latest
     Ollama(OllamaArgs),
 
     /// Ask Clive to edit a file in-place (or preview changes)
+    /// Example: clive edit src/main.rs "Add logging" --write
     Edit(EditArgs),
 
     /// Generate a unified diff and optionally apply it
+    /// Example: clive patch src/main.rs "Extract helper functions" --write
     Patch(EditArgs),
 
     /// Generate shell completions
+    /// Example: clive completions bash
     Completions(CompletionsArgs),
 }
 
 #[derive(Args, Debug)]
 struct ChatArgs {
     /// Prompt to send to the model
+    /// Example: clive chat "Explain Rust ownership"
     prompt: String,
 
     /// Model name (e.g. llama3.1, codellama, qwen2.5-coder)
+    /// Example: --model qwen2.5-coder:latest
     #[arg(short, long)]
     model: Option<String>,
 
     /// Optional system message to steer behavior
+    /// Example: --system "Be concise and practical"
     #[arg(short, long)]
     system: Option<String>,
 
     /// Disable token streaming and wait for full response
+    /// Example: --no-stream
     #[arg(long, action = ArgAction::SetTrue)]
     no_stream: bool,
 }
@@ -96,28 +114,35 @@ struct ChatArgs {
 #[derive(Args, Debug)]
 struct EditArgs {
     /// Path to file you want to modify
+    /// Example: src/main.rs
     file: PathBuf,
 
     /// Edit instruction for the assistant
+    /// Example: "Add structured logging"
     instruction: String,
 
     /// Model name to use for editing
+    /// Example: --model qwen2.5-coder:latest
     #[arg(short, long)]
     model: Option<String>,
 
     /// Write the generated changes to disk
+    /// Example: --write
     #[arg(long)]
     write: bool,
 
     /// Create a .bak copy before writing
+    /// Example: --write --backup
     #[arg(long)]
     backup: bool,
 
     /// Refuse to write if git sees uncommitted changes in target file
+    /// Example: --write --require-clean-git
     #[arg(long)]
     require_clean_git: bool,
 
     /// Stage the file with git add after writing
+    /// Example: --write --stage
     #[arg(long)]
     stage: bool,
 }
@@ -125,16 +150,83 @@ struct EditArgs {
 #[derive(Args, Debug)]
 struct SessionArgs {
     /// Model name (e.g. qwen2.5-coder, codellama)
+    /// Example: --model qwen2.5-coder:latest
     #[arg(short, long)]
     model: Option<String>,
 
     /// Optional system instruction
+    /// Example: --system "Be concise and production-focused"
     #[arg(short, long)]
     system: Option<String>,
 
     /// Disable token streaming and wait for full response
+    /// Example: --no-stream
     #[arg(long, action = ArgAction::SetTrue)]
     no_stream: bool,
+}
+
+#[derive(Args, Debug)]
+struct AgentArgs {
+    /// Goal to accomplish
+    /// Example: "Refactor error handling and add tests"
+    goal: String,
+
+    /// Files Clive is allowed to edit
+    /// Example: --files src/main.rs README.md
+    #[arg(long, short = 'f', required = true)]
+    files: Vec<PathBuf>,
+
+    /// Verification commands to run after each apply (repeat flag)
+    /// Example: --verify "cargo check -q"
+    #[arg(long, short = 'v')]
+    verify: Vec<String>,
+
+    /// Model name override for this run
+    /// Example: --model qwen2.5-coder:latest
+    #[arg(short, long)]
+    model: Option<String>,
+
+    /// Apply edits to files. Without this, only previews are shown.
+    /// Example: --apply
+    #[arg(long)]
+    apply: bool,
+
+    /// Roll back all changed files if verification fails
+    /// Example: --rollback-on-fail
+    #[arg(long)]
+    rollback_on_fail: bool,
+
+    /// Require target files to be clean in git before applying edits
+    /// Example: --require-clean-git
+    #[arg(long)]
+    require_clean_git: bool,
+
+    /// Output machine-readable run summary JSON
+    /// Example: --json
+    #[arg(long)]
+    json: bool,
+
+    /// Allow agent plans to execute run_command actions
+    /// Example: --allow-agent-commands
+    #[arg(long)]
+    allow_agent_commands: bool,
+
+    /// Agent execution profile
+    /// Example: --profile strict
+    #[arg(long, value_enum, default_value_t = AgentProfile::Balanced)]
+    profile: AgentProfile,
+
+    /// Maximum agent refinement iterations
+    /// Example: --max-iterations 3
+    #[arg(long)]
+    max_iterations: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AgentProfile {
+    Quick,
+    Balanced,
+    Strict,
 }
 
 #[derive(Args, Debug)]
@@ -158,6 +250,7 @@ enum OllamaCommand {
 #[derive(Args, Debug)]
 struct ServeArgs {
     /// Start in the background and return immediately
+    /// Example: --detach
     #[arg(long)]
     detach: bool,
 }
@@ -165,22 +258,26 @@ struct ServeArgs {
 #[derive(Args, Debug)]
 struct PullArgs {
     /// Model name to install (e.g. qwen2.5-coder:latest)
+    /// Example: qwen2.5-coder:latest
     model: String,
 }
 
 #[derive(Args, Debug)]
 struct ModelNameArg {
     /// Model name
+    /// Example: qwen2.5-coder:latest
     model: String,
 }
 
 #[derive(Args, Debug)]
 struct RecommendArgs {
     /// Recommendation profile
+    /// Example: --profile rust
     #[arg(long, value_enum, default_value_t = RecommendProfile::Coding)]
     profile: RecommendProfile,
 
     /// Only show models that are already installed
+    /// Example: --installed-only
     #[arg(long)]
     installed_only: bool,
 }
@@ -196,6 +293,7 @@ enum RecommendProfile {
 #[derive(Args, Debug)]
 struct CompletionsArgs {
     /// Target shell (bash, zsh, fish, powershell, elvish)
+    /// Example: bash
     #[arg(value_enum)]
     shell: Shell,
 }
@@ -216,6 +314,55 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     message: Message,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentPlan {
+    summary: String,
+    #[serde(default)]
+    edits: Vec<AgentEdit>,
+    #[serde(default)]
+    actions: Vec<AgentAction>,
+    done: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentEdit {
+    file: String,
+    updated_content: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum AgentAction {
+    #[serde(rename = "edit_file")]
+    EditFile {
+        file: String,
+        updated_content: String,
+        reason: Option<String>,
+    },
+    #[serde(rename = "add_file")]
+    AddFile {
+        file: String,
+        content: String,
+        reason: Option<String>,
+    },
+    #[serde(rename = "run_command")]
+    RunCommand {
+        command: String,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct AgentRunReport {
+    goal: String,
+    iterations: usize,
+    changed_files: Vec<String>,
+    verify_commands: Vec<String>,
+    success: bool,
+    rolled_back: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +412,7 @@ fn run() -> Result<()> {
         Commands::Models => cmd_models(&ollama),
         Commands::Doctor => cmd_doctor(&ollama),
         Commands::Session(args) => cmd_session(&ollama, args, &default_model),
+        Commands::Agent(args) => cmd_agent(&ollama, args, &default_model),
         Commands::Ollama(args) => cmd_ollama(&ollama, args),
         Commands::Edit(args) => cmd_edit(&ollama, args, false, &default_model),
         Commands::Patch(args) => cmd_edit(&ollama, args, true, &default_model),
@@ -446,6 +594,399 @@ fn cmd_session(
     }
 
     Ok(())
+}
+
+fn cmd_agent(ollama: &OllamaClient, args: AgentArgs, default_model: &Option<String>) -> Result<()> {
+    if args.files.is_empty() {
+        bail!("Provide at least one file with --files");
+    }
+
+    let model = resolve_model(ollama, args.model, default_model);
+    let max_iterations = args
+        .max_iterations
+        .unwrap_or_else(|| default_agent_iterations(args.profile));
+
+    let mut target_files = Vec::new();
+    for file in &args.files {
+        if file.exists() && !file.is_file() {
+            bail!("Target path is not a file: {}", file.display());
+        }
+        target_files.push(file.clone());
+    }
+
+    if args.require_clean_git && args.apply {
+        for file in &target_files {
+            if file.exists() {
+                ensure_clean_git_for_file(file)?;
+            }
+        }
+    }
+
+    let mut backups: HashMap<PathBuf, String> = HashMap::new();
+    let mut changed_files: Vec<String> = Vec::new();
+    let mut verification_feedback = String::new();
+    let mut last_verify_commands: Vec<String> = Vec::new();
+    let mut success = false;
+
+    for iteration in 1..=max_iterations {
+        let mut file_payload = String::new();
+        let mut file_map: HashMap<String, String> = HashMap::new();
+        let mut allowed_map: HashMap<String, PathBuf> = HashMap::new();
+
+        for file in &target_files {
+            let file_key = file.display().to_string();
+            let normalized = normalize_file_key(&file_key);
+            allowed_map.insert(normalized, file.clone());
+
+            if file.exists() {
+                let content = fs::read_to_string(file)
+                    .with_context(|| format!("Failed to read {}", file.display()))?;
+                file_map.insert(file_key.clone(), content.clone());
+                file_payload.push_str(&format!(
+                    "\n<file path=\"{}\">\n{}\n</file>\n",
+                    file_key, content
+                ));
+            } else {
+                file_map.insert(file_key.clone(), String::new());
+                file_payload.push_str(&format!(
+                    "\n<file path=\"{}\">\n<missing_file />\n</file>\n",
+                    file_key
+                ));
+            }
+        }
+
+        let prompt = build_agent_prompt(
+            &args.goal,
+            &target_files,
+            &file_payload,
+            &args.verify,
+            &verification_feedback,
+            iteration,
+            max_iterations,
+        );
+
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "You are Clive agent. Produce only JSON matching the required schema with concrete actions. Keep changes minimal, deterministic, and safe.".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: prompt,
+            },
+        ];
+
+        let response = ollama.chat(&model, messages)?;
+        let mut plan = parse_agent_plan(&response.message.content)?;
+
+        if !args.json {
+            println!("\n[agent] Iteration {iteration}/{max_iterations}: {}", plan.summary);
+        }
+
+        for edit in plan.edits {
+            plan.actions.push(AgentAction::EditFile {
+                file: edit.file,
+                updated_content: edit.updated_content,
+                reason: edit.reason,
+            });
+        }
+
+        let mut applied_in_iteration = false;
+
+        for action in plan.actions {
+            match action {
+                AgentAction::EditFile {
+                    file,
+                    updated_content,
+                    reason,
+                } => {
+                    let normalized = normalize_file_key(&file);
+                    let target = allowed_map
+                        .get(&normalized)
+                        .ok_or_else(|| anyhow!("Agent attempted to edit disallowed file: {file}"))?;
+
+                    let old = file_map
+                        .get(&target.display().to_string())
+                        .ok_or_else(|| anyhow!("Missing preloaded file content for {}", target.display()))?;
+
+                    if updated_content == *old {
+                        continue;
+                    }
+
+                    if !args.json {
+                        if let Some(reason) = &reason {
+                            println!("\n[agent] {}: {}", target.display(), reason);
+                        }
+                        print_diff(target, old, &updated_content);
+                    }
+
+                    if args.apply {
+                        backups.entry(target.clone()).or_insert_with(|| old.clone());
+                        fs::write(target, &updated_content)
+                            .with_context(|| format!("Failed to write {}", target.display()))?;
+                        applied_in_iteration = true;
+
+                        let target_name = target.display().to_string();
+                        if !changed_files.iter().any(|f| f == &target_name) {
+                            changed_files.push(target_name);
+                        }
+                    }
+                }
+                AgentAction::AddFile { file, content, reason } => {
+                    let normalized = normalize_file_key(&file);
+                    let target = allowed_map
+                        .get(&normalized)
+                        .ok_or_else(|| anyhow!("Agent attempted to add disallowed file: {file}"))?;
+
+                    let old = if target.exists() {
+                        fs::read_to_string(target)
+                            .with_context(|| format!("Failed to read {}", target.display()))?
+                    } else {
+                        String::new()
+                    };
+
+                    if !args.json {
+                        if let Some(reason) = &reason {
+                            println!("\n[agent] create {}: {}", target.display(), reason);
+                        }
+                        print_diff(target, &old, &content);
+                    }
+
+                    if args.apply {
+                        if let Some(parent) = target.parent() {
+                            fs::create_dir_all(parent).with_context(|| {
+                                format!("Failed to create parent directory for {}", target.display())
+                            })?;
+                        }
+
+                        backups.entry(target.clone()).or_insert(old);
+                        fs::write(target, &content)
+                            .with_context(|| format!("Failed to write {}", target.display()))?;
+                        applied_in_iteration = true;
+
+                        let target_name = target.display().to_string();
+                        if !changed_files.iter().any(|f| f == &target_name) {
+                            changed_files.push(target_name);
+                        }
+                    }
+                }
+                AgentAction::RunCommand { command, reason } => {
+                    if !args.allow_agent_commands {
+                        bail!(
+                            "Agent returned run_command action but --allow-agent-commands is not enabled"
+                        );
+                    }
+
+                    if !args.json {
+                        if let Some(reason) = &reason {
+                            println!("\n[agent] run `{}`: {}", command, reason);
+                        } else {
+                            println!("\n[agent] run `{}`", command);
+                        }
+                    }
+
+                    if args.apply {
+                        let command_output = run_shell_command(&command)
+                            .with_context(|| format!("Failed to run agent command: {command}"))?;
+                        verification_feedback.push_str(&format!(
+                            "\n[agent_command] {command}\n{command_output}\n"
+                        ));
+                        applied_in_iteration = true;
+                    }
+                }
+            }
+        }
+
+        if !args.apply {
+            success = true;
+            break;
+        }
+
+        if !applied_in_iteration && plan.done.unwrap_or(false) {
+            success = true;
+            break;
+        }
+
+        let verify_commands = if args.verify.is_empty() {
+            default_verify_commands(args.profile)
+        } else {
+            args.verify.clone()
+        };
+
+        last_verify_commands = verify_commands.clone();
+        let verify_report = run_verify_commands(&verify_commands)?;
+        verification_feedback.push_str(&verify_report.output);
+
+        if verify_report.success {
+            if !args.json {
+                println!("[agent] Verification passed.");
+            }
+            if plan.done.unwrap_or(true) {
+                success = true;
+                break;
+            }
+        } else if !args.json {
+            println!("[agent] Verification failed. Refining in next iteration...");
+        }
+    }
+
+    let mut rolled_back = false;
+    if args.apply && !success && args.rollback_on_fail {
+        for (path, content) in backups {
+            if content.is_empty() {
+                let _ = fs::remove_file(&path);
+            } else {
+                fs::write(&path, content)
+                    .with_context(|| format!("Failed to restore {}", path.display()))?;
+            }
+        }
+        rolled_back = true;
+    }
+
+    if args.json {
+        let report = AgentRunReport {
+            goal: args.goal,
+            iterations: max_iterations,
+            changed_files,
+            verify_commands: last_verify_commands,
+            success,
+            rolled_back,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("Failed to serialize report")?
+        );
+    }
+
+    if !success {
+        bail!("Agent workflow did not converge within {max_iterations} iteration(s)");
+    }
+
+    Ok(())
+}
+
+fn build_agent_prompt(
+    goal: &str,
+    files: &[PathBuf],
+    file_payload: &str,
+    verify_commands: &[String],
+    verification_feedback: &str,
+    iteration: usize,
+    max_iterations: usize,
+) -> String {
+    let file_list = files
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let verify_list = if verify_commands.is_empty() {
+        "(none)".to_string()
+    } else {
+        verify_commands.join("; ")
+    };
+
+    format!(
+        "Goal: {goal}\n\
+Iteration: {iteration}/{max_iterations}\n\
+Allowed files: {file_list}\n\
+Verification commands: {verify_list}\n\
+Previous verification output:\n{verification_feedback}\n\n\
+Return ONLY JSON with this shape:\n\
+{{\"summary\":\"...\",\"done\":true|false,\"actions\":[\
+{{\"type\":\"edit_file\",\"file\":\"<allowed path>\",\"updated_content\":\"<full file text>\",\"reason\":\"...\"}},\
+{{\"type\":\"add_file\",\"file\":\"<allowed path>\",\"content\":\"<full file text>\",\"reason\":\"...\"}},\
+{{\"type\":\"run_command\",\"command\":\"cargo check -q\",\"reason\":\"...\"}}\
+]}}\n\
+For backward compatibility you may also return edits[] instead of actions[].\n\
+Do not include markdown fences.\n\
+Current files:\n{file_payload}"
+    )
+}
+
+fn parse_agent_plan(raw: &str) -> Result<AgentPlan> {
+    let json_text = extract_json_object(raw)?;
+    serde_json::from_str(&json_text).context("Failed to parse agent JSON plan")
+}
+
+fn extract_json_object(raw: &str) -> Result<String> {
+    if raw.trim_start().starts_with('{') {
+        return Ok(raw.trim().to_string());
+    }
+
+    let start = raw
+        .find('{')
+        .ok_or_else(|| anyhow!("Agent response does not contain JSON object"))?;
+    let end = raw
+        .rfind('}')
+        .ok_or_else(|| anyhow!("Agent response does not contain closing JSON brace"))?;
+    if end <= start {
+        bail!("Malformed JSON object in agent response");
+    }
+
+    Ok(raw[start..=end].trim().to_string())
+}
+
+fn normalize_file_key(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn default_agent_iterations(profile: AgentProfile) -> usize {
+    match profile {
+        AgentProfile::Quick => 1,
+        AgentProfile::Balanced => 2,
+        AgentProfile::Strict => 3,
+    }
+}
+
+fn default_verify_commands(profile: AgentProfile) -> Vec<String> {
+    match profile {
+        AgentProfile::Quick => vec!["cargo check -q".to_string()],
+        AgentProfile::Balanced => vec!["cargo check -q".to_string()],
+        AgentProfile::Strict => vec!["cargo check -q".to_string(), "cargo test -q".to_string()],
+    }
+}
+
+struct VerifyReport {
+    success: bool,
+    output: String,
+}
+
+fn run_verify_commands(commands: &[String]) -> Result<VerifyReport> {
+    if commands.is_empty() {
+        return Ok(VerifyReport {
+            success: true,
+            output: String::new(),
+        });
+    }
+
+    let mut output = String::new();
+    let mut success = true;
+
+    for cmd in commands {
+        let result = run_shell_command(cmd)
+            .with_context(|| format!("Verification command failed to run: {cmd}"))?;
+        output.push_str(&format!("$ {cmd}\n{}\n", result));
+
+        if !result.starts_with("exit=0") {
+            success = false;
+            break;
+        }
+    }
+
+    Ok(VerifyReport { success, output })
+}
+
+fn run_shell_command(command: &str) -> Result<String> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .output()
+        .with_context(|| format!("Failed to execute shell command: {command}"))?;
+
+    let code = output.status.code().unwrap_or(1);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(format!("exit={code}\nstdout:\n{stdout}\nstderr:\n{stderr}"))
 }
 
 fn cmd_ollama(ollama: &OllamaClient, args: OllamaArgs) -> Result<()> {
@@ -1010,6 +1551,41 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_agent_command_with_safety_and_automation_flags() {
+        let cli = Cli::try_parse_from([
+            "clive",
+            "agent",
+            "refactor error handling",
+            "--files",
+            "src/main.rs",
+            "--verify",
+            "cargo check -q",
+            "--apply",
+            "--rollback-on-fail",
+            "--json",
+            "--profile",
+            "strict",
+            "--max-iterations",
+            "3",
+        ])
+        .expect("agent args should parse");
+
+        match cli.command {
+            Commands::Agent(agent) => {
+                assert!(agent.apply);
+                assert!(agent.rollback_on_fail);
+                assert!(agent.json);
+                assert!(!agent.allow_agent_commands);
+                assert!(matches!(agent.profile, AgentProfile::Strict));
+                assert_eq!(agent.max_iterations, Some(3));
+                assert_eq!(agent.files.len(), 1);
+                assert_eq!(agent.verify, vec!["cargo check -q"]);
+            }
+            _ => panic!("expected agent command"),
+        }
+    }
+
+    #[test]
     fn resolve_model_name_prefers_local_global_installed_default() {
         let installed = vec!["installed-model:latest".to_string()];
 
@@ -1095,6 +1671,52 @@ mod tests {
         let err = pull_model_with_runner("broken-model", |_, _| Ok(failure_status()))
             .expect_err("expected failure");
         assert!(err.to_string().contains("ollama pull exited"));
+    }
+
+    #[test]
+    fn extract_json_object_handles_wrapped_model_output() {
+        let raw = "Here you go:\n```json\n{\"summary\":\"ok\",\"edits\":[],\"done\":true}\n```";
+        let extracted = extract_json_object(raw).expect("json should be extracted");
+        assert!(extracted.starts_with('{'));
+        assert!(extracted.ends_with('}'));
+    }
+
+    #[test]
+    fn parse_agent_plan_accepts_minimal_valid_payload() {
+        let raw = r#"{"summary":"done","edits":[],"done":true}"#;
+        let plan = parse_agent_plan(raw).expect("plan should parse");
+        assert_eq!(plan.summary, "done");
+        assert!(plan.done.unwrap_or(false));
+        assert!(plan.edits.is_empty());
+    }
+
+    #[test]
+    fn parse_agent_plan_accepts_action_payload() {
+        let raw = r#"{"summary":"step","actions":[{"type":"run_command","command":"cargo check -q","reason":"verify"}],"done":false}"#;
+        let plan = parse_agent_plan(raw).expect("action plan should parse");
+        assert_eq!(plan.summary, "step");
+        assert_eq!(plan.actions.len(), 1);
+        match &plan.actions[0] {
+            AgentAction::RunCommand { command, reason } => {
+                assert_eq!(command, "cargo check -q");
+                assert_eq!(reason.as_deref(), Some("verify"));
+            }
+            _ => panic!("expected run_command action"),
+        }
+    }
+
+    #[test]
+    fn default_agent_iterations_follow_profile() {
+        assert_eq!(default_agent_iterations(AgentProfile::Quick), 1);
+        assert_eq!(default_agent_iterations(AgentProfile::Balanced), 2);
+        assert_eq!(default_agent_iterations(AgentProfile::Strict), 3);
+    }
+
+    #[test]
+    fn default_verify_commands_include_tests_for_strict_profile() {
+        let strict = default_verify_commands(AgentProfile::Strict);
+        assert_eq!(strict.len(), 2);
+        assert!(strict.iter().any(|c| c == "cargo test -q"));
     }
 
     #[test]

@@ -16,6 +16,7 @@ Clive is a local coding-assistant CLI powered by Ollama models. It supports stre
 - Chat with local Ollama models
 - Stream tokens in real time (chat and session)
 - Interactive multi-turn coding sessions
+- Autonomous multi-file agent workflows
 - Manage Ollama from Clive (serve, pull/install, remove)
 - Get curated model recommendations by profile
 - List installed models and verify connectivity
@@ -23,6 +24,7 @@ Clive is a local coding-assistant CLI powered by Ollama models. It supports stre
 - Generate unified patches and optionally apply
 - Optional git safety checks and auto-stage on write
 - Shell completions for bash, zsh, fish, powershell, and elvish
+- Non-interactive JSON reports for automation
 
 ## Prerequisites
 
@@ -204,12 +206,56 @@ Session commands:
 - /clear resets conversation context (keeps system instruction)
 - /exit exits the session
 
-### Edit a File (Diff Preview)
+### Agent Workflow (Phase 1, 2, 3)
+
+Run an autonomous workflow over specific files:
 
 ```bash
-clive edit src/main.rs "Add structured logging and stronger error handling"
+clive agent "Refactor error handling and add tests" \
+	--files src/main.rs \
+	--verify "cargo check -q" \
+	--apply
 ```
 
+Key options:
+
+- `--files` required allow-list of files Clive may edit
+- `--verify` repeatable verification commands after apply
+- `--apply` writes edits to disk (otherwise preview only)
+- `--rollback-on-fail` restores originals if verification never passes
+- `--require-clean-git` refuses writes when target files are dirty
+- `--profile quick|balanced|strict` adjusts default iteration and verification behavior
+- `--max-iterations` overrides profile default loop depth
+- `--json` prints machine-readable run report for CI/automation
+- `--allow-agent-commands` allows `run_command` actions from the model (disabled by default for safety)
+
+Strict profile example:
+
+```bash
+clive agent "Harden CLI argument validation" \
+	--files src/main.rs \
+	--apply \
+	--rollback-on-fail \
+	--profile strict
+```
+
+Automation-friendly JSON mode:
+
+```bash
+clive --no-banner agent "Improve docs" \
+	--files README.md \
+	--json
+```
+
+Enable command actions when you explicitly trust the run context:
+
+```bash
+clive agent "Run formatter and fix lint issues" \
+        --files src/main.rs \
+        --apply \
+        --allow-agent-commands \
+        --verify "cargo check -q"
+```
 Apply changes:
 
 ```bash
