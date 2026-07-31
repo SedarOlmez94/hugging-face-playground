@@ -1,0 +1,13 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"name": "Run Clive Extension",
+			"type": "extensionHost",
+			"request": "launch",
+			"args": ["--extensionDevelopmentPath=${workspaceFolder}/clive-vscode"],
+			"outFiles": ["${workspaceFolder}/clive-vscode/dist/**/*.js"],
+			"preLaunchTask": "Build Clive Extension"
+		}
+	]
+}

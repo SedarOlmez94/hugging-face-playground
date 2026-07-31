@@ -207,6 +207,15 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Rust build artifacts
+clive/target/
+
+# VS Code extension build artifacts
+clive-vscode/node_modules/
+clive-vscode/dist/
+clive-vscode/out/
+clive-vscode/.vscode-test/
+
 # PyPI configuration file
 .pypirc
 

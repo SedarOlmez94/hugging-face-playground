@@ -572,25 +572,40 @@ fn cmd_session(
             content: input.to_string(),
         });
 
-        let assistant = if args.no_stream {
-            let response = ollama.chat(&model, messages.clone())?;
-            let assistant = response.message.content.trim().to_string();
-            println!("\n{assistant}\n");
-            assistant
+        let assistant_result = if args.no_stream {
+            ollama
+                .chat(&model, messages.clone())
+                .map(|r| {
+                    let text = r.message.content.trim().to_string();
+                    println!("\n{text}\n");
+                    text
+                })
         } else {
             println!();
-            let assistant = ollama.chat_stream(&model, messages.clone(), |chunk| {
+            let result = ollama.chat_stream(&model, messages.clone(), |chunk| {
                 print!("{chunk}");
                 let _ = io::stdout().flush();
-            })?;
+            });
             println!("\n");
-            assistant.trim().to_string()
+            result.map(|s| s.trim().to_string())
         };
 
-        messages.push(Message {
-            role: "assistant".to_string(),
-            content: assistant,
-        });
+        match assistant_result {
+            Ok(assistant) => {
+                messages.push(Message {
+                    role: "assistant".to_string(),
+                    content: assistant,
+                });
+            }
+            Err(err) => {
+                // Print the error but keep the session alive so the user
+                // can retry without losing conversation context.
+                eprintln!("\nError: {err:#}");
+                eprintln!("(Session continues. Type /exit to quit.)\n");
+                // Remove the failed user message so context stays consistent.
+                messages.pop();
+            }
+        }
     }
 
     Ok(())
@@ -1353,17 +1368,32 @@ fn human_size(size: u64) -> String {
 }
 
 struct OllamaClient {
+    /// Client used for streaming / long-running requests – no read timeout.
     client: Client,
+    /// Client used for quick management requests (tags, version, pull progress).
+    /// Times out after 30 seconds so network errors surface quickly.
+    quick_client: Client,
     base_url: String,
 }
 
 impl OllamaClient {
     fn new(base_url: String) -> Result<Self> {
+        // No read timeout: large models (deepseek, llama3, etc.) can take
+        // many seconds to produce the first token, so we must not cut the
+        // connection while waiting for inference to begin.
         let client = Client::builder()
+            .timeout(None)
             .build()
             .context("Failed to initialize HTTP client")?;
+
+        let quick_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("Failed to initialize quick HTTP client")?;
+
         Ok(Self {
             client,
+            quick_client,
             base_url: base_url.trim_end_matches('/').to_string(),
         })
     }
@@ -1451,7 +1481,7 @@ impl OllamaClient {
     fn tags(&self) -> Result<TagsResponse> {
         let url = format!("{}/api/tags", self.base_url);
         let response = self
-            .client
+            .quick_client
             .get(url)
             .send()
             .context("Failed to call Ollama tags endpoint")?;
@@ -1474,7 +1504,7 @@ impl OllamaClient {
     fn version(&self) -> Result<String> {
         let url = format!("{}/api/version", self.base_url);
         let response = self
-            .client
+            .quick_client
             .get(url)
             .send()
             .context("Failed to call Ollama version endpoint")?;
@@ -1500,7 +1530,7 @@ impl OllamaClient {
     fn delete(&self, model: &str) -> Result<()> {
         let url = format!("{}/api/delete", self.base_url);
         let response = self
-            .client
+            .quick_client
             .delete(url)
             .json(&serde_json::json!({ "model": model }))
             .send()

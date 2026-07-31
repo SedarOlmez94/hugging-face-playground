@@ -1,0 +1,183 @@
+{
+  "name": "clive-vscode",
+  "displayName": "Clive",
+  "description": "VS Code extension for Clive, the local Ollama coding assistant",
+  "version": "0.1.0",
+  "publisher": "sedarolmez",
+  "engines": {
+    "vscode": "^1.118.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:clive.chatView",
+    "onCommand:clive.openChat",
+    "onCommand:clive.chat",
+    "onCommand:clive.session",
+    "onCommand:clive.agent",
+    "onCommand:clive.models",
+    "onCommand:clive.doctor",
+    "onCommand:clive.ollamaServe",
+    "onCommand:clive.ollamaPull",
+    "onCommand:clive.ollamaRemove",
+    "onCommand:clive.ollamaRecommend",
+    "onCommand:clive.editFile",
+    "onCommand:clive.patchFile",
+    "onCommand:clive.completions",
+    "onCommand:clive.showOutput",
+    "onCommand:clive.runRawCommand"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "clive-sidebar",
+          "title": "Clive",
+          "icon": "media/clive-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "clive-sidebar": [
+        {
+          "type": "webview",
+          "id": "clive.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "clive.openChat",
+        "title": "Clive: Open Chat UI",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "clive.chat",
+        "title": "Clive: Chat"
+      },
+      {
+        "command": "clive.session",
+        "title": "Clive: Start Session"
+      },
+      {
+        "command": "clive.agent",
+        "title": "Clive: Run Agent Workflow"
+      },
+      {
+        "command": "clive.models",
+        "title": "Clive: List Models"
+      },
+      {
+        "command": "clive.doctor",
+        "title": "Clive: Run Doctor"
+      },
+      {
+        "command": "clive.ollamaServe",
+        "title": "Clive: Ollama Serve"
+      },
+      {
+        "command": "clive.ollamaPull",
+        "title": "Clive: Ollama Pull"
+      },
+      {
+        "command": "clive.ollamaRemove",
+        "title": "Clive: Ollama Remove"
+      },
+      {
+        "command": "clive.ollamaRecommend",
+        "title": "Clive: Ollama Recommend"
+      },
+      {
+        "command": "clive.editFile",
+        "title": "Clive: Edit File"
+      },
+      {
+        "command": "clive.patchFile",
+        "title": "Clive: Generate Patch"
+      },
+      {
+        "command": "clive.completions",
+        "title": "Clive: Generate Shell Completions"
+      },
+      {
+        "command": "clive.showOutput",
+        "title": "Clive: Show Output"
+      },
+      {
+        "command": "clive.runRawCommand",
+        "title": "Clive: Run Raw Command"
+      }
+    ],
+    "configuration": {
+      "title": "Clive",
+      "properties": {
+        "clive.executablePath": {
+          "type": "string",
+          "default": "clive",
+          "description": "Path to the Clive executable."
+        },
+        "clive.ollamaUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "Override the Ollama base URL used by Clive."
+        },
+        "clive.defaultModel": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "description": "Default model passed to Clive when a command supports it."
+        },
+        "clive.noBanner": {
+          "type": "boolean",
+          "default": true,
+          "description": "Pass --no-banner to Clive when supported."
+        },
+        "clive.terminalCwd": {
+          "type": "string",
+          "default": "workspaceFolder",
+          "enum": [
+            "workspaceFolder",
+            "file",
+            "prompt"
+          ],
+          "description": "How interactive commands choose their working directory."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && npm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "@types/vscode": "^1.118.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
+    "esbuild": "^0.28.1",
+    "eslint": "^10.5.0",
+    "npm-run-all": "^1.1.3",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  }
+}
