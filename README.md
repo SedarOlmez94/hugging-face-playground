@@ -116,6 +116,17 @@ pre-commit install
 pre-commit run --all-files
 ```
 
+## 🖥️ Launch Clive at Linux startup
+
+If you want Clive to open in a terminal automatically when you log into Linux, this repo now includes a launcher:
+
+```bash
+cd /home/olmez/Documents/Development/hugging-face-playground
+./start-clive.sh
+```
+
+The first run installs an autostart desktop entry at ~/.config/autostart/clive.desktop. See [docs/clive-linux-autostart.md](docs/clive-linux-autostart.md) for details and how to disable it later.
+
 ## 🤝 Contributing
 
 Contributions are welcome! Whether it's fixing a bug, adding a new experiment, or improving documentation — all contributions are appreciated.
