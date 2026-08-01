@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::collections::HashMap;
@@ -87,12 +87,17 @@ enum Commands {
     /// Generate shell completions
     /// Example: clive completions bash
     Completions(CompletionsArgs),
+
+    /// View or edit Clive's persistent configuration
+    /// Example: clive config set model qwen2.5-coder:latest
+    Config(ConfigArgs),
 }
 
 #[derive(Args, Debug)]
 struct ChatArgs {
-    /// Prompt to send to the model
+    /// Prompt to send to the model (optional when piping via stdin)
     /// Example: clive chat "Explain Rust ownership"
+    #[arg(default_value = "")]
     prompt: String,
 
     /// Model name (e.g. llama3.1, codellama, qwen2.5-coder)
@@ -104,6 +109,11 @@ struct ChatArgs {
     /// Example: --system "Be concise and practical"
     #[arg(short, long)]
     system: Option<String>,
+
+    /// Read additional context from stdin and append it to the prompt
+    /// Example: cat file.rs | clive chat "review this" --stdin
+    #[arg(long, action = ArgAction::SetTrue)]
+    stdin: bool,
 
     /// Disable token streaming and wait for full response
     /// Example: --no-stream
@@ -298,6 +308,66 @@ struct CompletionsArgs {
     shell: Shell,
 }
 
+#[derive(Args, Debug)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Print the current configuration and its file path
+    /// Example: clive config show
+    Show,
+    /// Set a configuration value (model, ollama_url, system)
+    /// Example: clive config set model qwen2.5-coder:latest
+    Set(ConfigSetArgs),
+    /// Clear a configuration value (model, ollama_url, system)
+    /// Example: clive config unset system
+    Unset(ConfigKeyArg),
+    /// Print the path to the configuration file
+    /// Example: clive config path
+    Path,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ConfigKey {
+    Model,
+    OllamaUrl,
+    System,
+}
+
+#[derive(Args, Debug)]
+struct ConfigSetArgs {
+    /// Configuration key to set
+    /// Example: model
+    #[arg(value_enum)]
+    key: ConfigKey,
+
+    /// Value to store
+    /// Example: qwen2.5-coder:latest
+    value: String,
+}
+
+#[derive(Args, Debug)]
+struct ConfigKeyArg {
+    /// Configuration key to clear
+    /// Example: system
+    #[arg(value_enum)]
+    key: ConfigKey,
+}
+
+/// Persistent user configuration stored as JSON on disk.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct CliveConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ollama_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ChatRequest {
     model: String,
@@ -305,10 +375,15 @@ struct ChatRequest {
     stream: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Message {
     role: String,
+    #[serde(default)]
     content: String,
+    /// Reasoning/thinking tokens emitted by thinking models (e.g. qwen3, r1).
+    /// Only present on responses; never sent back in requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,24 +474,35 @@ fn run() -> Result<()> {
         print_banner();
     }
 
+    // Load persisted config; CLI flags and env vars still take precedence.
+    let config = load_config().unwrap_or_default();
+
+    // Config command does not need a live Ollama client.
+    if let Commands::Config(args) = &cli.command {
+        return cmd_config(args);
+    }
+
     let base_url = cli
         .ollama_url
         .or_else(|| std::env::var("OLLAMA_HOST").ok())
+        .or_else(|| config.ollama_url.clone())
         .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
 
     let ollama = OllamaClient::new(base_url)?;
-    let default_model = cli.model.clone();
+    let default_model = cli.model.clone().or_else(|| config.model.clone());
+    let default_system = config.system.clone();
 
     match cli.command {
-        Commands::Chat(args) => cmd_chat(&ollama, args, &default_model),
+        Commands::Chat(args) => cmd_chat(&ollama, args, &default_model, &default_system),
         Commands::Models => cmd_models(&ollama),
         Commands::Doctor => cmd_doctor(&ollama),
-        Commands::Session(args) => cmd_session(&ollama, args, &default_model),
+        Commands::Session(args) => cmd_session(&ollama, args, &default_model, &default_system),
         Commands::Agent(args) => cmd_agent(&ollama, args, &default_model),
         Commands::Ollama(args) => cmd_ollama(&ollama, args),
         Commands::Edit(args) => cmd_edit(&ollama, args, false, &default_model),
         Commands::Patch(args) => cmd_edit(&ollama, args, true, &default_model),
         Commands::Completions(args) => cmd_completions(args),
+        Commands::Config(_) => unreachable!("handled before client creation"),
     }
 }
 
@@ -437,6 +523,110 @@ fn resolve_model(ollama: &OllamaClient, local: Option<String>, global: &Option<S
     resolve_model_name(&installed_models, local, global)
 }
 
+/// Resolve the path to Clive's configuration file, honoring platform
+/// conventions and the CLIVE_CONFIG override without extra dependencies.
+fn config_file_path() -> Result<PathBuf> {
+    if let Ok(explicit) = std::env::var("CLIVE_CONFIG") {
+        if !explicit.trim().is_empty() {
+            return Ok(PathBuf::from(explicit));
+        }
+    }
+
+    let base_dir = if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("Could not determine config directory (APPDATA unset)"))?
+    } else if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    {
+        xdg
+    } else {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("Could not determine config directory (HOME unset)"))?;
+        home.join(".config")
+    };
+
+    Ok(base_dir.join("clive").join("config.json"))
+}
+
+/// Load persisted configuration, returning defaults if the file is absent.
+fn load_config() -> Result<CliveConfig> {
+    let path = config_file_path()?;
+    if !path.exists() {
+        return Ok(CliveConfig::default());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read config at {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("Failed to parse config at {}", path.display()))
+}
+
+/// Persist configuration to disk, creating parent directories as needed.
+fn save_config(config: &CliveConfig) -> Result<PathBuf> {
+    let path = config_file_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create config directory {}", parent.display()))?;
+    }
+    let serialized =
+        serde_json::to_string_pretty(config).context("Failed to serialize configuration")?;
+    fs::write(&path, format!("{serialized}\n"))
+        .with_context(|| format!("Failed to write config to {}", path.display()))?;
+    Ok(path)
+}
+
+fn cmd_config(args: &ConfigArgs) -> Result<()> {
+    match &args.command {
+        ConfigCommand::Show => {
+            let path = config_file_path()?;
+            let config = load_config()?;
+            println!("Config file: {}", path.display());
+            println!(
+                "  model:      {}",
+                config.model.as_deref().unwrap_or("(unset)")
+            );
+            println!(
+                "  ollama_url: {}",
+                config.ollama_url.as_deref().unwrap_or("(unset)")
+            );
+            println!(
+                "  system:     {}",
+                config.system.as_deref().unwrap_or("(unset)")
+            );
+        }
+        ConfigCommand::Path => {
+            println!("{}", config_file_path()?.display());
+        }
+        ConfigCommand::Set(set) => {
+            let mut config = load_config()?;
+            match set.key {
+                ConfigKey::Model => config.model = Some(set.value.clone()),
+                ConfigKey::OllamaUrl => config.ollama_url = Some(set.value.clone()),
+                ConfigKey::System => config.system = Some(set.value.clone()),
+            }
+            let path = save_config(&config)?;
+            println!("Updated {:?} = {}", set.key, set.value);
+            println!("Saved to {}", path.display());
+        }
+        ConfigCommand::Unset(key) => {
+            let mut config = load_config()?;
+            match key.key {
+                ConfigKey::Model => config.model = None,
+                ConfigKey::OllamaUrl => config.ollama_url = None,
+                ConfigKey::System => config.system = None,
+            }
+            let path = save_config(&config)?;
+            println!("Cleared {:?}", key.key);
+            println!("Saved to {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+
 fn resolve_model_name(
     installed_models: &[String],
     local: Option<String>,
@@ -452,24 +642,47 @@ fn resolve_model_name(
         .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
-fn cmd_chat(ollama: &OllamaClient, args: ChatArgs, default_model: &Option<String>) -> Result<()> {
+fn cmd_chat(
+    ollama: &OllamaClient,
+    args: ChatArgs,
+    default_model: &Option<String>,
+    default_system: &Option<String>,
+) -> Result<()> {
     let model = resolve_model(ollama, args.model, default_model);
     let mut messages = Vec::new();
-    if let Some(system) = args.system {
+    let system = args.system.or_else(|| default_system.clone());
+    if let Some(system) = system {
         messages.push(Message {
             role: "system".to_string(),
             content: system,
+            ..Default::default()
         });
+    }
+
+    // Combine the positional prompt with piped stdin (if any) so users can do
+    // `cat file.rs | clive chat "review this" --stdin` or pipe content with no
+    // prompt at all. We only ever block on a stdin read when it is safe to do
+    // so, otherwise a normal `clive chat "message"` would hang forever.
+    let prompt = combine_prompt_with_stdin(&args.prompt, args.stdin)?;
+    if prompt.trim().is_empty() {
+        bail!("No prompt provided. Pass a message, or pipe input, e.g. `git diff | clive chat`.");
     }
     messages.push(Message {
         role: "user".to_string(),
-        content: args.prompt,
+        content: prompt,
+        ..Default::default()
     });
 
     if args.no_stream {
-        let response = ollama.chat(&model, messages)?;
+        let spinner = Spinner::start("Thinking");
+        let response = ollama.chat(&model, messages);
+        spinner.stop();
+        let response = response?;
         println!("{}", response.message.content.trim());
     } else {
+        // No spinner here: streamed thinking/content tokens already provide
+        // live feedback, and a spinner writing to stderr would interleave with
+        // the thinking output that chat_stream emits.
         let full = ollama.chat_stream(&model, messages, |chunk| {
             print!("{chunk}");
             let _ = io::stdout().flush();
@@ -479,6 +692,48 @@ fn cmd_chat(ollama: &OllamaClient, args: ChatArgs, default_model: &Option<String
         }
     }
     Ok(())
+}
+
+/// Merge the positional prompt with any content piped via stdin.
+///
+/// To avoid ever blocking the common `clive chat "message"` case, stdin is only
+/// read when:
+///   * the user explicitly passes `--stdin` (`force` is true), or
+///   * no prompt was given AND stdin is not a terminal (a real pipe).
+///
+/// In every other case the original prompt is returned unchanged.
+fn combine_prompt_with_stdin(prompt: &str, force: bool) -> Result<String> {
+    use std::io::IsTerminal;
+
+    let prompt_is_empty = prompt.trim().is_empty();
+    let stdin_is_pipe = !io::stdin().is_terminal();
+
+    // Only read stdin when it is safe: explicitly requested, or there is no
+    // prompt and stdin is actually piped in.
+    let should_read = force || (prompt_is_empty && stdin_is_pipe);
+    if !should_read {
+        return Ok(prompt.to_string());
+    }
+
+    // If the user forced --stdin but stdin is an interactive terminal, don't
+    // hang waiting for EOF; just use the prompt as-is.
+    if force && !stdin_is_pipe {
+        return Ok(prompt.to_string());
+    }
+
+    let mut piped = String::new();
+    io::stdin()
+        .read_to_string(&mut piped)
+        .context("Failed to read piped stdin")?;
+    let piped = piped.trim_end();
+
+    if piped.is_empty() {
+        return Ok(prompt.to_string());
+    }
+    if prompt_is_empty {
+        return Ok(piped.to_string());
+    }
+    Ok(format!("{prompt}\n\n{piped}"))
 }
 
 fn cmd_models(ollama: &OllamaClient) -> Result<()> {
@@ -500,9 +755,39 @@ fn cmd_models(ollama: &OllamaClient) -> Result<()> {
 }
 
 fn cmd_doctor(ollama: &OllamaClient) -> Result<()> {
-    let version = ollama.version()?;
-    println!("Ollama reachable at {}", ollama.base_url);
-    println!("Version: {version}");
+    println!("Clive v{}", env!("CARGO_PKG_VERSION"));
+
+    match config_file_path() {
+        Ok(path) => {
+            let exists = if path.exists() { "found" } else { "not created yet" };
+            println!("Config:  {} ({exists})", path.display());
+        }
+        Err(err) => println!("Config:  unavailable ({err})"),
+    }
+
+    match ollama.version() {
+        Ok(version) => {
+            println!("Ollama:  reachable at {}", ollama.base_url);
+            println!("Version: {version}");
+        }
+        Err(err) => {
+            println!("Ollama:  NOT reachable at {}", ollama.base_url);
+            println!("         {err:#}");
+            println!("Hint:    start it with `clive ollama serve --detach`");
+            return Ok(());
+        }
+    }
+
+    match ollama.tags() {
+        Ok(tags) => {
+            println!("Models:  {} installed locally", tags.models.len());
+            if tags.models.is_empty() {
+                println!("Hint:    pull one with `clive ollama pull qwen2.5-coder:latest`");
+            }
+        }
+        Err(err) => println!("Models:  could not list ({err})"),
+    }
+
     Ok(())
 }
 
@@ -510,24 +795,28 @@ fn cmd_session(
     ollama: &OllamaClient,
     args: SessionArgs,
     default_model: &Option<String>,
+    default_system: &Option<String>,
 ) -> Result<()> {
     let model = resolve_model(ollama, args.model, default_model);
     let mut messages = Vec::new();
 
-    if let Some(system) = args.system {
+    let system = args.system.or_else(|| default_system.clone());
+    if let Some(system) = system {
         messages.push(Message {
             role: "system".to_string(),
             content: system,
+            ..Default::default()
         });
     } else {
         messages.push(Message {
             role: "system".to_string(),
             content: "You are Clive, a practical coding assistant. Prefer concise, correct answers with runnable code examples when useful.".to_string(),
+            ..Default::default()
         });
     }
 
     println!("Interactive session started with model: {model}");
-    println!("Commands: /help, /clear, /exit");
+    println!("Commands: /help, /clear, /save <file>, /load <file>, /exit");
 
     loop {
         print!("> ");
@@ -548,20 +837,54 @@ fn cmd_session(
             continue;
         }
 
-        match input {
+        // Handle slash-commands (some take an argument after a space).
+        let (command, argument) = match input.split_once(char::is_whitespace) {
+            Some((cmd, rest)) => (cmd, rest.trim()),
+            None => (input, ""),
+        };
+
+        match command {
             "/exit" | "/quit" => {
                 println!("Session ended.");
                 break;
             }
             "/help" => {
-                println!("/help  Show commands");
-                println!("/clear Clear conversation context");
-                println!("/exit  Exit session");
+                println!("/help          Show commands");
+                println!("/clear         Clear conversation context");
+                println!("/save <file>   Save conversation history to a JSON file");
+                println!("/load <file>   Load conversation history from a JSON file");
+                println!("/exit          Exit session");
                 continue;
             }
             "/clear" => {
                 messages.retain(|m| m.role == "system");
                 println!("Conversation context cleared.");
+                continue;
+            }
+            "/save" => {
+                if argument.is_empty() {
+                    eprintln!("Usage: /save <file>");
+                    continue;
+                }
+                match save_session_history(argument, &messages) {
+                    Ok(count) => println!("Saved {count} message(s) to {argument}"),
+                    Err(err) => eprintln!("Failed to save session: {err:#}"),
+                }
+                continue;
+            }
+            "/load" => {
+                if argument.is_empty() {
+                    eprintln!("Usage: /load <file>");
+                    continue;
+                }
+                match load_session_history(argument) {
+                    Ok(loaded) => {
+                        let count = loaded.len();
+                        messages = loaded;
+                        println!("Loaded {count} message(s) from {argument}");
+                    }
+                    Err(err) => eprintln!("Failed to load session: {err:#}"),
+                }
                 continue;
             }
             _ => {}
@@ -570,16 +893,18 @@ fn cmd_session(
         messages.push(Message {
             role: "user".to_string(),
             content: input.to_string(),
+            ..Default::default()
         });
 
         let assistant_result = if args.no_stream {
-            ollama
-                .chat(&model, messages.clone())
-                .map(|r| {
-                    let text = r.message.content.trim().to_string();
-                    println!("\n{text}\n");
-                    text
-                })
+            let spinner = Spinner::start("Thinking");
+            let result = ollama.chat(&model, messages.clone());
+            spinner.stop();
+            result.map(|r| {
+                let text = r.message.content.trim().to_string();
+                println!("\n{text}\n");
+                text
+            })
         } else {
             println!();
             let result = ollama.chat_stream(&model, messages.clone(), |chunk| {
@@ -595,6 +920,7 @@ fn cmd_session(
                 messages.push(Message {
                     role: "assistant".to_string(),
                     content: assistant,
+                    ..Default::default()
                 });
             }
             Err(err) => {
@@ -609,6 +935,22 @@ fn cmd_session(
     }
 
     Ok(())
+}
+
+/// Serialize the conversation to a JSON file and return the message count.
+fn save_session_history(path: &str, messages: &[Message]) -> Result<usize> {
+    let serialized =
+        serde_json::to_string_pretty(messages).context("Failed to serialize session history")?;
+    fs::write(path, format!("{serialized}\n"))
+        .with_context(|| format!("Failed to write session history to {path}"))?;
+    Ok(messages.len())
+}
+
+/// Load a previously saved conversation from a JSON file.
+fn load_session_history(path: &str) -> Result<Vec<Message>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read session history from {path}"))?;
+    serde_json::from_str(&raw).context("Failed to parse session history JSON")
 }
 
 fn cmd_agent(ollama: &OllamaClient, args: AgentArgs, default_model: &Option<String>) -> Result<()> {
@@ -684,10 +1026,12 @@ fn cmd_agent(ollama: &OllamaClient, args: AgentArgs, default_model: &Option<Stri
             Message {
                 role: "system".to_string(),
                 content: "You are Clive agent. Produce only JSON matching the required schema with concrete actions. Keep changes minimal, deterministic, and safe.".to_string(),
+                ..Default::default()
             },
             Message {
                 role: "user".to_string(),
                 content: prompt,
+                ..Default::default()
             },
         ];
 
@@ -1046,11 +1390,11 @@ fn cmd_ollama_pull(ollama: &OllamaClient, args: PullArgs) -> Result<()> {
 
     println!("Model pull completed: {}", args.model);
 
-    if let Ok(tags) = ollama.tags() {
-        if let Some(model) = tags.models.into_iter().find(|m| m.name.starts_with(&args.model)) {
-            let size = model.size.map(human_size).unwrap_or_else(|| "unknown".to_string());
-            println!("Installed: {} ({})", model.name, size);
-        }
+    if let Ok(tags) = ollama.tags()
+        && let Some(model) = tags.models.into_iter().find(|m| m.name.starts_with(&args.model))
+    {
+        let size = model.size.map(human_size).unwrap_or_else(|| "unknown".to_string());
+        println!("Installed: {} ({})", model.name, size);
     }
 
     Ok(())
@@ -1205,10 +1549,12 @@ fn cmd_edit(
         Message {
             role: "system".to_string(),
             content: "You are Clive, a careful coding assistant. Follow the requested change exactly and return only the updated file content in <updated_file>...</updated_file>.".to_string(),
+            ..Default::default()
         },
         Message {
             role: "user".to_string(),
             content: prompt,
+            ..Default::default()
         },
     ];
 
@@ -1367,6 +1713,73 @@ fn human_size(size: u64) -> String {
     format!("{size_f:.1} {}", units[unit])
 }
 
+/// A minimal terminal spinner shown while waiting on a blocking request.
+/// It runs on a background thread and only animates when stderr is a TTY, so
+/// piped/redirected output stays clean.
+struct Spinner {
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    active: bool,
+}
+
+impl Spinner {
+    fn start(label: &str) -> Self {
+        use std::io::IsTerminal;
+
+        let active = io::stderr().is_terminal();
+        if !active {
+            return Self {
+                running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                handle: None,
+                active,
+            };
+        }
+
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let thread_flag = running.clone();
+        let label = label.to_string();
+        let handle = std::thread::spawn(move || {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let mut idx = 0usize;
+            while thread_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                eprint!("\r{} {label}...", frames[idx % frames.len()]);
+                let _ = io::stderr().flush();
+                idx += 1;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+        });
+
+        Self {
+            running,
+            handle: Some(handle),
+            active,
+        }
+    }
+
+    fn stop(mut self) {
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.running
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = handle.join();
+            if self.active {
+                // Clear the spinner line.
+                eprint!("\r\x1b[2K");
+                let _ = io::stderr().flush();
+            }
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 struct OllamaClient {
     /// Client used for streaming / long-running requests – no read timeout.
     client: Client,
@@ -1449,6 +1862,7 @@ impl OllamaClient {
         }
 
         let mut full = String::new();
+        let mut thinking_started = false;
         let reader = BufReader::new(response);
         for line in reader.lines() {
             let line = line.context("Failed to read streamed Ollama response")?;
@@ -1464,7 +1878,28 @@ impl OllamaClient {
             }
 
             if let Some(msg) = chunk.message {
+                // Thinking/reasoning models (qwen3, deepseek-r1, etc.) stream
+                // their reasoning in a separate `thinking` field while
+                // `content` stays empty. Surface it to stderr so the user sees
+                // progress instead of an apparent hang, but keep it out of the
+                // returned answer so conversation history stays clean.
+                if let Some(thinking) = msg.thinking.as_deref()
+                    && !thinking.is_empty()
+                {
+                    if !thinking_started {
+                        eprint!("\x1b[2m[thinking] ");
+                        thinking_started = true;
+                    }
+                    eprint!("{thinking}");
+                    let _ = io::stderr().flush();
+                }
+
                 if !msg.content.is_empty() {
+                    if thinking_started {
+                        // Close the thinking block before the real answer.
+                        eprintln!("\x1b[0m");
+                        thinking_started = false;
+                    }
                     on_chunk(&msg.content);
                     full.push_str(&msg.content);
                 }
@@ -1473,6 +1908,10 @@ impl OllamaClient {
             if chunk.done {
                 break;
             }
+        }
+
+        if thinking_started {
+            eprintln!("\x1b[0m");
         }
 
         Ok(full)
@@ -1757,6 +2196,125 @@ mod tests {
 
         let result = ensure_clean_git_for_file(&file_path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn combine_prompt_with_stdin_returns_prompt_when_not_forced() {
+        // A non-empty prompt without --stdin must never touch stdin, so this is
+        // deterministic regardless of how the test harness wires up stdin.
+        let combined = combine_prompt_with_stdin("hello", false).expect("combine");
+        assert_eq!(combined, "hello");
+    }
+
+    #[test]
+    fn message_deserializes_thinking_field_and_omits_it_when_absent() {
+        // Thinking models stream a separate `thinking` field with empty content.
+        let raw = r#"{"role":"assistant","content":"","thinking":"let me reason"}"#;
+        let msg: Message = serde_json::from_str(raw).expect("deserialize");
+        assert_eq!(msg.thinking.as_deref(), Some("let me reason"));
+        assert_eq!(msg.content, "");
+
+        // Missing content/thinking should still deserialize (defaults apply).
+        let minimal: Message = serde_json::from_str(r#"{"role":"user"}"#).expect("deserialize");
+        assert_eq!(minimal.content, "");
+        assert!(minimal.thinking.is_none());
+
+        // Requests must not include a null thinking field.
+        let outgoing = Message {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&outgoing).expect("serialize");
+        assert!(!json.contains("thinking"));
+    }
+
+    #[test]
+    fn clive_config_serializes_only_set_fields() {
+        let config = CliveConfig {
+            model: Some("qwen2.5-coder:latest".to_string()),
+            ollama_url: None,
+            system: None,
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        assert!(json.contains("qwen2.5-coder:latest"));
+        assert!(!json.contains("ollama_url"));
+        assert!(!json.contains("system"));
+    }
+
+    #[test]
+    fn clive_config_round_trips_through_json() {
+        let config = CliveConfig {
+            model: Some("m".to_string()),
+            ollama_url: Some("http://localhost:1234".to_string()),
+            system: Some("be brief".to_string()),
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let parsed: CliveConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.model.as_deref(), Some("m"));
+        assert_eq!(parsed.ollama_url.as_deref(), Some("http://localhost:1234"));
+        assert_eq!(parsed.system.as_deref(), Some("be brief"));
+    }
+
+    #[test]
+    fn config_file_path_honors_explicit_override() {
+        // SAFETY: single-threaded test setting/clearing a process env var.
+        unsafe { std::env::set_var("CLIVE_CONFIG", "/tmp/clive-test-config.json") };
+        let path = config_file_path().expect("path");
+        assert_eq!(path, PathBuf::from("/tmp/clive-test-config.json"));
+        unsafe { std::env::remove_var("CLIVE_CONFIG") };
+    }
+
+    #[test]
+    fn session_history_round_trips_through_disk() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("history.json");
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let count = save_session_history(&file_str, &messages).expect("save");
+        assert_eq!(count, 2);
+
+        let loaded = load_session_history(&file_str).expect("load");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].role, "system");
+        assert_eq!(loaded[1].content, "hi");
+    }
+
+    #[test]
+    fn cli_parses_config_set_command() {
+        let cli = Cli::try_parse_from([
+            "clive",
+            "--no-banner",
+            "config",
+            "set",
+            "model",
+            "qwen2.5-coder:latest",
+        ])
+        .expect("config set should parse");
+
+        match cli.command {
+            Commands::Config(args) => match args.command {
+                ConfigCommand::Set(set) => {
+                    assert!(matches!(set.key, ConfigKey::Model));
+                    assert_eq!(set.value, "qwen2.5-coder:latest");
+                }
+                _ => panic!("expected config set command"),
+            },
+            _ => panic!("expected config command"),
+        }
     }
 
     #[cfg(unix)]
